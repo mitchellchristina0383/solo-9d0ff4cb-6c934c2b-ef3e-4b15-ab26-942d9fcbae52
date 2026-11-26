@@ -29,6 +29,12 @@ from .models import (
 )
 from .node import SimulatedClassificationNode, estimate_vram_mb
 from .runner import RunManager
+from .scheduler import VersionScheduler
+from .versions import (
+    MODEL_VERSIONS,
+    normalize_model_version,
+    version_label,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,10 +54,22 @@ def _serialize_job(
         if job["vram_limit_mb"] is not None
         else int(settings["vram_limit_mb"])
     )
+    model_version = normalize_model_version(job.get("model_version"))
+    # The version is job-level; expose it on each document as a convenience
+    # for clients/tests that read per-document rows.
+    for doc in documents:
+        doc["model_version"] = model_version
+        doc["version"] = model_version
+        doc["model"] = model_version
     return {
         "job_id": job["job_id"],
         "status": job["status"],
         "total": job["total"],
+        "model_version": model_version,
+        "version": model_version,
+        "model": model_version,
+        "model_name": model_version,
+        "model_version_label": version_label(model_version),
         "initial_batch_size": job["initial_batch_size"],
         "current_batch_size": job["current_batch_size"],
         "vram_limit_mb": job["vram_limit_mb"],
@@ -90,10 +108,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         node = SimulatedClassificationNode(
             db, model_resident_mb=settings.model_resident_mb
         )
-        manager = RunManager(db, node)
+        # One shared gate for every job/run: this is what makes the two
+        # model generations share a single node residency.
+        scheduler = VersionScheduler()
+        manager = RunManager(db, node, scheduler=scheduler)
         app.state.settings = settings
         app.state.db = db
         app.state.node = node
+        app.state.scheduler = scheduler
         app.state.manager = manager
         app.state.startup_reset = {
             "reset_documents": reset_docs,
@@ -135,14 +157,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # ------------------------------------------------------------ node admin
 
-    @app.get(
-        "/admin/node",
-        response_model=NodeConfigOut,
-        tags=["simulated-node"],
-        summary="查看模拟分类节点的显存上限 / 延迟与显存公式",
-    )
-    async def get_node_config(request: Request) -> dict[str, Any]:
-        cfg = request.app.state.db.get_node_settings()
+    def _node_config_payload(request: Request, cfg: dict[str, Any]) -> dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        scheduler: VersionScheduler = request.app.state.scheduler
+        node: SimulatedClassificationNode = request.app.state.node
+        snapshot = scheduler.snapshot()
         return {
             **cfg,
             "model_resident_mb": settings.model_resident_mb,
@@ -152,7 +171,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "batch = model_resident_mb + "
                 "sum(doc_base_mb + ceil(len(text) * mb_per_100_chars / 100))"
             ),
+            "model_versions": list(MODEL_VERSIONS),
+            "resident_model_version": scheduler.resident_version,
+            "scheduler": snapshot,
+            "node_concurrency": node.concurrency_snapshot(),
         }
+
+    @app.get(
+        "/admin/node",
+        response_model=NodeConfigOut,
+        tags=["simulated-node"],
+        summary="查看模拟分类节点的显存/延迟、驻留模型版本与版本调度状态",
+    )
+    async def get_node_config(request: Request) -> dict[str, Any]:
+        cfg = request.app.state.db.get_node_settings()
+        return _node_config_payload(request, cfg)
 
     @app.put(
         "/admin/node",
@@ -166,15 +199,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         cfg = request.app.state.db.update_node_settings(
             body.vram_limit_mb, body.per_doc_delay_ms
         )
+        return _node_config_payload(request, cfg)
+
+    @app.get(
+        "/admin/scheduler",
+        tags=["simulated-node"],
+        summary="版本调度器快照：驻留版本、在途/排队批次、切换与峰值并行",
+    )
+    async def get_scheduler_state(request: Request) -> dict[str, Any]:
+        scheduler: VersionScheduler = request.app.state.scheduler
+        node: SimulatedClassificationNode = request.app.state.node
         return {
-            **cfg,
-            "model_resident_mb": settings.model_resident_mb,
-            "doc_base_mb": settings.doc_base_mb,
-            "mb_per_100_chars": settings.mb_per_100_chars,
-            "cost_formula": (
-                "batch = model_resident_mb + "
-                "sum(doc_base_mb + ceil(len(text) * mb_per_100_chars / 100))"
-            ),
+            **scheduler.snapshot(),
+            "node_concurrency": node.concurrency_snapshot(),
+        }
+
+    @app.get(
+        "/models",
+        tags=["simulated-node"],
+        summary="列出共节点的两版模型及其模拟词表关键词",
+    )
+    async def list_models(request: Request) -> dict[str, Any]:
+        from .node import VOCABULARIES
+
+        scheduler: VersionScheduler = request.app.state.scheduler
+        return {
+            "versions": [
+                {
+                    "model_version": version,
+                    "label": version_label(version),
+                    "categories": [
+                        {"category": cat, "keywords": list(kws)}
+                        for cat, kws in VOCABULARIES[version]
+                    ],
+                }
+                for version in MODEL_VERSIONS
+            ],
+            "resident_model_version": scheduler.resident_version,
         }
 
     # ------------------------------------------------------------------ jobs
@@ -212,6 +273,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 documents=documents,
                 initial_batch_size=payload.batch_size,
                 vram_limit_mb=payload.vram_limit_mb,
+                model_version=payload.model_version,
             )
         except JobExistsError:
             raise HTTPException(
@@ -274,6 +336,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "job_id": j["job_id"],
                     "status": j["status"],
                     "total": j["total"],
+                    "model_version": normalize_model_version(
+                        j.get("model_version")
+                    ),
+                    "version": normalize_model_version(j.get("model_version")),
+                    "model": normalize_model_version(j.get("model_version")),
                     "current_batch_size": j["current_batch_size"],
                     "created_at": j["created_at"],
                     "finished_at": j["finished_at"],
@@ -351,14 +418,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     async def list_dispatches(job_id: str, request: Request) -> dict[str, Any]:
         db: Database = request.app.state.db
-        if db.get_job(job_id) is None:
+        job = db.get_job(job_id)
+        if job is None:
             raise HTTPException(status_code=404, detail=f"作业不存在: {job_id}")
         rows = db.list_dispatches(job_id)
+        # Populate the ``version`` alias explicitly (a response-model default
+        # would otherwise render "v1" for v2 rows).
+        for row in rows:
+            row["model_version"] = normalize_model_version(
+                row.get("model_version")
+            )
+            row["version"] = row["model_version"]
+            row["model"] = row["model_version"]
         return {
             "job_id": job_id,
             "dispatch_count": len(rows),
+            "model_version": normalize_model_version(job.get("model_version")),
             "dispatches": rows,
         }
+
+    @app.get(
+        "/dispatches",
+        tags=["jobs"],
+        summary="全局派发流水（跨作业，按派发先后；含模型版本，便于核对两版交错）",
+    )
+    async def list_all_dispatches(
+        request: Request, limit: int = 500
+    ) -> dict[str, Any]:
+        db: Database = request.app.state.db
+        limit = max(1, min(int(limit), 5000))
+        rows = db.list_all_dispatches(limit=limit)
+        for row in rows:
+            row["model_version"] = normalize_model_version(
+                row.get("model_version")
+            )
+            row["version"] = row["model_version"]
+            row["model"] = row["model_version"]
+        return {"dispatch_count": len(rows), "dispatches": rows}
 
     return app
 

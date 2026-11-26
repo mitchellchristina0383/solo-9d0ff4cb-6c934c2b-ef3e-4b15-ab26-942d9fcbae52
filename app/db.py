@@ -21,6 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .versions import normalize_model_version
+
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -34,6 +36,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     initial_batch_size  INTEGER NOT NULL,
     current_batch_size  INTEGER NOT NULL,
     vram_limit_mb       INTEGER,
+    model_version       TEXT NOT NULL DEFAULT 'v1',
     last_error          TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
@@ -74,6 +77,7 @@ CREATE TABLE IF NOT EXISTS dispatch_log (
     batch_id        TEXT NOT NULL,
     vram_limit_mb   INTEGER NOT NULL,
     estimate_mb     INTEGER NOT NULL,
+    model_version   TEXT NOT NULL DEFAULT 'v1',
     dispatched_at   TEXT NOT NULL
 );
 
@@ -120,6 +124,35 @@ class Database:
     def init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA_SQL)
+            self._migrate_locked()
+
+    def _table_columns_locked(self, table: str) -> set[str]:
+        return {
+            r["name"]
+            for r in self._conn.execute(f"PRAGMA table_info({table})")
+        }
+
+    def _migrate_locked(self) -> None:
+        """Idempotent upgrades for databases created by older releases.
+
+        The multi-version feature adds ``model_version`` to both ``jobs`` and
+        ``dispatch_log``.  ``ALTER TABLE ... ADD COLUMN ... DEFAULT 'v1'``
+        back-fills every pre-upgrade job and dispatch row with the original
+        model version -- exactly the required "升级前已有的作业也用原版".
+        """
+
+        job_cols = self._table_columns_locked("jobs")
+        if "model_version" not in job_cols:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN model_version "
+                "TEXT NOT NULL DEFAULT 'v1'"
+            )
+        dispatch_cols = self._table_columns_locked("dispatch_log")
+        if "model_version" not in dispatch_cols:
+            self._conn.execute(
+                "ALTER TABLE dispatch_log ADD COLUMN model_version "
+                "TEXT NOT NULL DEFAULT 'v1'"
+            )
 
     def seed_node_settings(self, vram_limit_mb: int, delay_ms: int) -> None:
         with self._lock:
@@ -166,12 +199,16 @@ class Database:
         documents: list[dict[str, Any]],
         initial_batch_size: int,
         vram_limit_mb: int | None,
+        model_version: str | None = None,
     ) -> dict[str, Any]:
         """Insert job + documents atomically.
 
         ``documents`` items need doc_id, content and vram_estimate_mb.
-        Raises JobExistsError if job_id is taken.
+        ``model_version`` is normalised to a canonical ``v1``/``v2`` token
+        and persisted for the job's whole lifetime (first batch through
+        restart-resume).  Raises JobExistsError if job_id is taken.
         """
+        version = normalize_model_version(model_version)
         now = utc_now_iso()
         with self._lock:
             try:
@@ -185,14 +222,15 @@ class Database:
                 self._conn.execute(
                     "INSERT INTO jobs (job_id, status, total, "
                     "initial_batch_size, current_batch_size, vram_limit_mb, "
-                    "created_at, updated_at) "
-                    "VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)",
+                    "model_version, created_at, updated_at) "
+                    "VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
                     (
                         job_id,
                         len(documents),
                         initial_batch_size,
                         initial_batch_size,
                         vram_limit_mb,
+                        version,
                         now,
                         now,
                     ),
@@ -306,19 +344,40 @@ class Database:
                               ("pending", "processing", "succeeded", "failed"))
         return counts
 
+    def has_pending_documents(self, job_id: str) -> bool:
+        """Cheap queue-intent check used before version admission.
+
+        Lets the runner avoid registering a phantom "other version batch
+        queued" waiter once the job has nothing left to claim.
+        """
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM documents WHERE job_id = ? "
+                "AND status = 'pending' LIMIT 1",
+                (job_id,),
+            ).fetchone()
+        return row is not None
+
     def claim_next_batch(
         self,
         job_id: str,
         max_docs: int,
         owner: str,
         vram_limit_mb: int,
+        model_version: str | None = None,
     ) -> list[dict[str, Any]]:
         """Atomically claim up to ``max_docs`` pending documents.
 
         Returns the claimed rows in submission order and appends one
         dispatch_log row per document, all in one immediate transaction.
         An empty list means there is nothing left to dispatch.
+
+        ``model_version`` is recorded on every dispatch_log row; callers must
+        only invoke this *after* the version scheduler admitted the batch, so
+        batches waiting for a switch never reach the dispatch ledger.
         """
+        version = normalize_model_version(model_version)
         batch_id = f"b_{uuid.uuid4().hex[:12]}"
         now = utc_now_iso()
         with self._lock:
@@ -349,8 +408,9 @@ class Database:
                 ).fetchall()
                 self._conn.executemany(
                     "INSERT INTO dispatch_log (job_id, seq, batch_id, "
-                    "vram_limit_mb, estimate_mb, dispatched_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "vram_limit_mb, estimate_mb, model_version, "
+                    "dispatched_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             job_id,
@@ -358,6 +418,7 @@ class Database:
                             batch_id,
                             vram_limit_mb,
                             d["vram_estimate_mb"],
+                            version,
                             now,
                         )
                         for d in docs
@@ -463,11 +524,29 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, seq, batch_id, vram_limit_mb, estimate_mb, "
-                "dispatched_at FROM dispatch_log "
+                "model_version, dispatched_at FROM dispatch_log "
                 "WHERE job_id = ? ORDER BY id ASC",
                 (job_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def list_all_dispatches(self, limit: int = 500) -> list[dict[str, Any]]:
+        """Global append-only dispatch stream across all jobs.
+
+        The id is globally monotonic, so ordering by id reveals the real
+        cross-job / cross-version dispatch interleaving.
+        """
+
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, job_id, seq, batch_id, vram_limit_mb, "
+                "estimate_mb, model_version, dispatched_at "
+                "FROM dispatch_log ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        # Return in ascending chronological order even though the query
+        # selected the most recent window DESC.
+        return [dict(r) for r in reversed(rows)]
 
     def new_owner(self) -> str:
         return f"run-{uuid.uuid4().hex[:12]}"

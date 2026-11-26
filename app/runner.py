@@ -1,4 +1,10 @@
-"""Job orchestration: dispatch batches, shrink on OOM, track one run per job."""
+"""Job orchestration: version admission, batch dispatch, OOM shrinking.
+
+One run task per job id.  Every batch passes through the shared
+:class:`app.scheduler.VersionScheduler` before it is claimed/written to the
+dispatch ledger, implementing the one-resident-model / drain-and-switch
+rules.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,8 @@ import logging
 
 from .db import Database
 from .node import SimulatedClassificationNode
+from .scheduler import VersionScheduler
+from .versions import DEFAULT_MODEL_VERSION, normalize_model_version
 
 logger = logging.getLogger("classifier.runner")
 
@@ -21,11 +29,22 @@ class RunManager:
     Correctness against duplicate dispatch does *not* rely on this map
     alone: ``Database.claim_next_batch`` is an atomic SQLite transaction
     that only claims pending rows.
+
+    All managers in one process should share one ``scheduler`` (the API
+    lifespan wires a single instance) so cross-version switching is
+    coordinated.  When omitted a private scheduler is created, which keeps
+    older direct-construction tests working.
     """
 
-    def __init__(self, db: Database, node: SimulatedClassificationNode):
+    def __init__(
+        self,
+        db: Database,
+        node: SimulatedClassificationNode,
+        scheduler: VersionScheduler | None = None,
+    ):
         self.db = db
         self.node = node
+        self.scheduler = scheduler or VersionScheduler()
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
     def is_running(self, job_id: str) -> bool:
@@ -58,6 +77,12 @@ class RunManager:
             logger.warning("run requested for unknown job %s", job_id)
             return
 
+        # The version is fixed on the job row at creation time and never
+        # changes: first batch, OOM retries and restart-resume all use it.
+        version = normalize_model_version(
+            job.get("model_version", DEFAULT_MODEL_VERSION)
+        )
+
         self.db.set_job_status(
             job_id, "running", set_started=True, clear_error=True
         )
@@ -68,85 +93,117 @@ class RunManager:
                 job = self.db.get_job(job_id)
                 if job is None:
                     return
-                settings = self.db.get_node_settings()
-                limit_mb = (
-                    int(job["vram_limit_mb"])
-                    if job["vram_limit_mb"] is not None
-                    else int(settings["vram_limit_mb"])
+                version = normalize_model_version(
+                    job.get("model_version", version)
                 )
 
-                batch = self.db.claim_next_batch(
-                    job_id, batch_size, owner, limit_mb
-                )
-                if not batch:
+                # Do not register a version waiter unless this job really
+                # has pending work; otherwise finished jobs would create
+                # phantom cross-version pressure.
+                if not self.db.has_pending_documents(job_id):
                     break
 
-                result = await self.node.classify_batch(batch, limit_mb)
+                # Queue at the shared node gate.  While another model
+                # version is being served this waits *before* the atomic
+                # claim, hence no dispatch_log row exists for a waiting batch.
+                ticket = await self.scheduler.admit(version)
+                try:
+                    # Resolve the limit at actual dispatch time so runtime
+                    # PUT /admin/node changes apply to post-switch batches.
+                    settings = self.db.get_node_settings()
+                    limit_mb = (
+                        int(job["vram_limit_mb"])
+                        if job["vram_limit_mb"] is not None
+                        else int(settings["vram_limit_mb"])
+                    )
 
-                for item in result.succeeded:
-                    self.db.mark_succeeded(
+                    batch = self.db.claim_next_batch(
                         job_id,
-                        int(item["seq"]),
-                        str(item["category"]),
-                        float(item["confidence"]),
+                        batch_size,
+                        owner,
+                        limit_mb,
+                        model_version=version,
+                    )
+                    if not batch:
+                        # Lost a cross-process race / nothing pending.
+                        continue
+
+                    # A real batch is now in the dispatch ledger with its
+                    # model version; this also satisfies minimum-dwell.
+                    self.scheduler.note_dispatched(ticket)
+
+                    result = await self.node.classify_batch(
+                        batch, limit_mb, model_version=version
                     )
 
-                if not result.oom_occurred:
-                    # Whole batch classified.  Batch size stays stable; we
-                    # never need to grow it for correctness.
-                    continue
+                    for item in result.succeeded:
+                        self.db.mark_succeeded(
+                            job_id,
+                            int(item["seq"]),
+                            str(item["category"]),
+                            float(item["confidence"]),
+                        )
 
-                oom = result.oom
-                assert oom is not None
-                succeeded_seqs = {int(i["seq"]) for i in result.succeeded}
-                unfinished = [
-                    d for d in batch if int(d["seq"]) not in succeeded_seqs
-                ]
+                    if not result.oom_occurred:
+                        # Whole batch classified.  Batch size stays stable; we
+                        # never need to grow it for correctness.
+                        continue
 
-                if batch_size <= 1:
-                    # A single document still does not fit: terminal failure
-                    # for this document only.  Nothing to release because
-                    # the batch contained exactly this one row.
-                    target = unfinished[0] if unfinished else batch[0]
-                    seq = int(target["seq"])
-                    resident_mb = (
-                        oom.required_total_mb
-                        - int(target["vram_estimate_mb"])
+                    oom = result.oom
+                    assert oom is not None
+                    succeeded_seqs = {int(i["seq"]) for i in result.succeeded}
+                    unfinished = [
+                        d for d in batch if int(d["seq"]) not in succeeded_seqs
+                    ]
+
+                    if batch_size <= 1:
+                        # A single document still does not fit: terminal
+                        # failure for this document only.  Nothing to release
+                        # because the batch contained exactly this one row.
+                        target = unfinished[0] if unfinished else batch[0]
+                        seq = int(target["seq"])
+                        resident_mb = (
+                            oom.required_total_mb
+                            - int(target["vram_estimate_mb"])
+                        )
+                        message = (
+                            f"[{version} 模型] 单篇文档 {target['doc_id']} "
+                            f"预估需要 {oom.required_total_mb}MB 显存"
+                            f"（节点常驻约 {resident_mb}MB"
+                            f" + 本文 {target['vram_estimate_mb']}MB），"
+                            f"超过当前上限 {oom.limit_mb}MB；缩批到 1 后仍 OOM，"
+                            f"记录为失败，其余文档继续处理。"
+                        )
+                        self.db.mark_failed(
+                            job_id, seq, ERR_DOCUMENT_TOO_LARGE, message
+                        )
+                        logger.info(
+                            "job %s doc seq=%s too large: required=%s limit=%s",
+                            job_id, seq, oom.required_total_mb, oom.limit_mb,
+                        )
+                        continue
+
+                    # Give the OOM remainder back and retry with a smaller
+                    # batch (halved, at least 1).  Partial results are already
+                    # durable and will never be dispatched again.
+                    self.db.release_to_pending(
+                        job_id, [int(d["seq"]) for d in unfinished], owner
                     )
-                    message = (
-                        f"单篇文档 {target['doc_id']} 预估需要 "
-                        f"{oom.required_total_mb}MB 显存"
-                        f"（节点常驻约 {resident_mb}MB"
-                        f" + 本文 {target['vram_estimate_mb']}MB），"
-                        f"超过当前上限 {oom.limit_mb}MB；缩批到 1 后仍 OOM，"
-                        f"记录为失败，其余文档继续处理。"
-                    )
-                    self.db.mark_failed(
-                        job_id, seq, ERR_DOCUMENT_TOO_LARGE, message
-                    )
+                    batch_size = max(1, batch_size // 2)
+                    self.db.update_current_batch_size(job_id, batch_size)
                     logger.info(
-                        "job %s doc seq=%s too large: required=%s limit=%s",
-                        job_id, seq, oom.required_total_mb, oom.limit_mb,
+                        "job %s OOM at seq=%s; %d partial ok, %d released; "
+                        "batch_size shrunk to %d",
+                        job_id,
+                        oom.next_seq,
+                        len(result.succeeded),
+                        len(unfinished),
+                        batch_size,
                     )
-                    continue
-
-                # Give the OOM remainder back and retry with a smaller
-                # batch (halved, at least 1).  Partial results are already
-                # durable and will never be dispatched again.
-                self.db.release_to_pending(
-                    job_id, [int(d["seq"]) for d in unfinished], owner
-                )
-                batch_size = max(1, batch_size // 2)
-                self.db.update_current_batch_size(job_id, batch_size)
-                logger.info(
-                    "job %s OOM at seq=%s; %d partial ok, %d released; "
-                    "batch_size shrunk to %d",
-                    job_id,
-                    oom.next_seq,
-                    len(result.succeeded),
-                    len(unfinished),
-                    batch_size,
-                )
+                finally:
+                    # Success or error: the batch is no longer in flight, so
+                    # a pending version switch is never blocked by us.
+                    self.scheduler.release(ticket)
 
             counts = self.db.status_counts(job_id)
             final_status = (
